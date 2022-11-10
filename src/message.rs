@@ -33,11 +33,22 @@ pub struct Message {
 }
 
 /// Cache of data values that the C msg struct point to.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub(crate) struct MessageData {
     pub(crate) topic: CString,
     pub(crate) payload: Vec<u8>,
     pub(crate) props: Properties,
+}
+
+impl std::fmt::Debug for MessageData {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let payload_prefix = &self.payload.as_slice()[0..std::cmp::min(32, self.payload.len())];
+        write!(
+            f,
+            "MessageData {{ topic: {:?}, payload: {:?}, props: {:?} }}",
+            self.topic, payload_prefix, self.props
+        )
+    }
 }
 
 impl MessageData {
@@ -122,8 +133,7 @@ impl Message {
 
         let payload = if cmsg.payload.is_null() {
             Vec::new()
-        }
-        else {
+        } else {
             unsafe { slice::from_raw_parts(cmsg.payload as *mut u8, len) }.to_vec()
         };
 

@@ -1,50 +1,39 @@
-// paho-mqtt/examples/ssl_publish.rs
-// Example application for Paho MQTT Rust library.
-//
-//! This is a simple asynchronous MQTT publisher using SSL/TSL secured
-//! connection via the Paho MQTT Rust Library.
 //!
-//! The sample demonstrates:
-//!   - Connecting to an MQTT server/broker securely
-//!   - Setting SSL/TLS options
-//!   - Publishing messages asynchronously
-//!   - Using using async/await
-//!
-//! We can test this using mosquitto configured with certificates in the
-//! Paho C library. The C library has an SSL/TSL test suite, and we can use
-//! that to test:
-//!     $ cd paho.mqtt.c
-//!     $ mosquitto -c test/tls-testing/mosquitto.conf
-//!
-//! Then use the files "test-root-ca.crt" and "client.pem" from the directory
-//! (paho.mqtt.c/test/ssl) for the trust and key stores for this program.
-//!
-//! Note that this configuration also works with secure websocket connection.
-//! Use the connection string:
-//!     wss://localhost:18885
+//! ```
+//! mkdir actcast
+//! # put AmazonRootCA1.pem to ./actcast
+//! # put device_rsa_key to ./actcast
+//! # put cert.pem to ./actcast
+//! #   e.g. jq -r '.cert' /var/actcast/initial_settings > ./actcast/cert.pem
+//! # set thing_name in this source code
+//! #   e.g. thing_name=$(jq -r '.thing_name' /var/actcast/initial_settings)
+//! #        sed -i -e "s|thing_name|${thing_name}|" $0.rs
+//! export RUST_LOG=trace
+//! export MQTT_C_CLIENT_TRACE=ON
+//! export MQTT_C_CLIENT_TRACE_LEVEL=MAXIMUM
+//! cargo run
+//! ```
 //!
 
-/*******************************************************************************
- * Copyright (c) 2017-2018 Frank Pagliughi <fpagliughi@mindspring.com>
- *
- * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the Eclipse Public License v1.0
- * and Eclipse Distribution License v1.0 which accompany this distribution.
- *
- * The Eclipse Public License is available at
- *    http://www.eclipse.org/legal/epl-v10.html
- * and the Eclipse Distribution License is available at
- *   http://www.eclipse.org/org/documents/edl-v10.php.
- *
- * Contributors:
- *    Frank Pagliughi - initial implementation and documentation
- *******************************************************************************/
-
-use futures::executor::block_on;
+use chrono::{serde::ts_milliseconds, DateTime, Utc};
+use futures::{executor::block_on, stream::StreamExt};
 use paho_mqtt as mqtt;
-use std::{env, process};
+use serde::{Deserialize, Serialize};
+use serde_json;
+use std::{path::PathBuf, process, time::Duration};
 
-/////////////////////////////////////////////////////////////////////////////
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SysLog {
+    pub thing_name: String,
+    pub payload: String,
+    // syslog loglevel [0, 7]
+    pub level: i8,
+    pub sequence_number: u64,
+    pub boot_id: String,
+    pub session_id: String,
+    #[serde(with = "ts_milliseconds")]
+    pub timestamp: DateTime<Utc>,
+}
 
 fn main() -> mqtt::Result<()> {
     // Initialize the logger from the environment
@@ -52,14 +41,17 @@ fn main() -> mqtt::Result<()> {
 
     // We use the trust store from the Paho C tls-testing/keys directory,
     // but we assume there's a copy in the current directory.
-    const TRUST_STORE: &str = "test-root-ca.crt";
-    const KEY_STORE: &str = "client.pem";
+    // ca_path
+    const TRUST_STORE: &str = "AmazonRootCA1.pem";
+
+    // cert_path
+    const KEY_STORE: &str = "cert.pem";
 
     // We assume that we are in a valid directory.
-    let mut trust_store = env::current_dir()?;
+    let mut trust_store = PathBuf::from("actcast");
     trust_store.push(TRUST_STORE);
 
-    let mut key_store = env::current_dir()?;
+    let mut key_store = PathBuf::from("actcast");
     key_store.push(KEY_STORE);
 
     if !trust_store.exists() {
@@ -74,48 +66,120 @@ fn main() -> mqtt::Result<()> {
         process::exit(1);
     }
 
+    let private_key = "actcast/device_rsa_key";
+    let thing_name = "62ca3fbf-a316-48f2-906d-51ee35ad66dd".to_string();
+
     // Let the user override the host, but note the "ssl://" protocol.
-    let host = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "ssl://localhost:18884".to_string());
+    let host = "ssl://a1sgglpp228nnc-ats.iot.ap-northeast-1.amazonaws.com:443".to_string();
 
     println!("Connecting to host: '{}'", host);
 
-    // Run the client in an async block
+    // Run the client in an async bloc
 
-    if let Err(err) = block_on(async {
+    // let pool = ThreadPool::new().unwrap();
+
+    let publisher = async {
         // Create a client & define connect options
         let cli = mqtt::CreateOptionsBuilder::new()
             .server_uri(&host)
-            .client_id("ssl_publish_rs")
-            .max_buffered_messages(100)
+            .client_id(&thing_name)
+            .max_buffered_messages(1024)
+            .send_while_disconnected(true)
+            .allow_disconnected_send_at_anytime(true)
+            .delete_oldest_messages(true)
+            .persistence(mqtt::PersistenceType::None)
+            .mqtt_version(4)
             .create_client()?;
 
+        let alpn = vec!["x-amzn-mqtt-ca"];
         let ssl_opts = mqtt::SslOptionsBuilder::new()
-            .trust_store(trust_store)?
             .key_store(key_store)?
+            .private_key(private_key)?
+            .ssl_version(mqtt::ssl_options::SslVersion::Tls_1_2)
+            .verify(true)
+            .trust_store(trust_store)?
+            .alpn_protos(&alpn)
+            .enable_server_cert_auth(true)
             .finalize();
 
         let conn_opts = mqtt::ConnectOptionsBuilder::new()
+            .retry_interval(Duration::from_secs(5))
+            .clean_session(false)
             .ssl_options(ssl_opts)
-            .user_name("testuser")
-            .password("testpassword")
             .finalize();
+
+        let recver = std::thread::Builder::new()
+            .name("recver".to_string())
+            .spawn({
+                let mut cli = cli.clone();
+                || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let mut strm = cli.get_stream(25);
+                        while let Some(m) = strm.next().await {
+                            if let Some(m) = m {
+                                println!("recv: {:?}", m);
+                            } else {
+                                println!("recv: disconnect");
+                                let re = cli.reconnect().wait();
+                                println!("reconnect: {:?}", re);
+                            }
+                        }
+                        println!("recv end");
+                        mqtt::Result::Ok(())
+                    })
+                }
+            })
+            .unwrap();
 
         cli.connect(conn_opts).await?;
 
+        let syslog_topic = format!(
+            "$aws/rules/actcast_stg_iot_syslog_rule/things/{}/syslog",
+            thing_name
+        );
+
+        let payload: String = {
+            // a payload larger than 128KB which is size limit of AWSIoT
+            let mut v = vec![];
+            v.push(0);
+            for _ in 0..128 * 1024 {
+                v.push(1);
+            }
+            v.push(2);
+            String::from_utf8_lossy(&v).into_owned()
+        };
+        let log = SysLog {
+            thing_name,
+            // payload: "Hello secure world!".to_string(),
+            payload,
+            level: 0,
+            sequence_number: 0,
+            boot_id: "0".to_string(),
+            session_id: "0".to_string(),
+            timestamp: Utc::now(),
+        };
         let msg = mqtt::MessageBuilder::new()
-            .topic("test")
-            .payload("Hello secure world!")
+            .topic(syslog_topic)
+            .payload(serde_json::to_vec(&log).unwrap())
             .qos(1)
             .finalize();
 
+        println!("publishing...");
         cli.publish(msg).await?;
-        cli.disconnect(None).await?;
+        println!("published");
 
-        Ok::<(), mqtt::Error>(())
-    }) {
-        eprintln!("{}", err);
-    }
-    Ok(())
+        println!("disconnecting...");
+        cli.disconnect(None).await?;
+        println!("disconnected");
+
+        println!("joining...");
+        let res = recver.join();
+        println!("joined: {:?}", res);
+        mqtt::Result::Ok(())
+    };
+    block_on(publisher)
 }
